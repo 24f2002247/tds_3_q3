@@ -27,8 +27,77 @@ def _exc_category(exc: Exception) -> str:
     return type(exc).__name__
 
 
+# ── Provider error-code sets (OpenAI-compatible) ───────────────────────────────
+#
+# These are the opaque machine-readable codes in error.code / error.type that
+# OpenAI-compatible providers return inside the 429 response body.  They are
+# safe to read and log: they are schema-controlled identifiers, never free-form
+# customer or prompt content.
+#
+# Billing/quota codes — retrying won't help; the account needs human action.
+_QUOTA_CODES: frozenset[str] = frozenset({
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+})
+
+# Rate-limit codes — transient; retrying with back-off is correct.
+_RATE_LIMIT_CODES: frozenset[str] = frozenset({
+    "rate_limit_exceeded",
+    "slow_down",
+    "tokens_per_minute_exceeded",
+    "requests_per_minute_exceeded",
+})
+
+
+def _classify_429(response: httpx.Response) -> str:
+    """Return a fine-grained diagnostic category for an HTTP 429 response.
+
+    Reads only ``error.code`` and ``error.type`` from the JSON body — both are
+    opaque provider-defined identifiers, never customer data.  Any parsing
+    failure falls back to the generic ``rate_limited`` label so the caller
+    always gets a usable string.
+
+    Returns one of:
+        ``quota_exceeded``   – billing/spend/quota problem; retrying is futile.
+        ``rate_limited_rpm`` – requests-per-minute limit; retry with back-off.
+        ``rate_limited_tpm`` – tokens-per-minute limit; retry with back-off.
+        ``rate_limited``     – generic transient rate limit.
+        ``rate_limited_unknown_429`` – 429 body missing or unrecognised code.
+    """
+    try:
+        body = response.json()
+        err = body.get("error", {})
+        # Prefer error.code; fall back to error.type (some providers only set one)
+        code: str = (err.get("code") or err.get("type") or "").lower()
+    except Exception:
+        # Response body is not JSON or is unreadable — generic label, no body logged
+        return "rate_limited_unknown_429"
+
+    if not code:
+        return "rate_limited_unknown_429"
+
+    if code in _QUOTA_CODES:
+        return "quota_exceeded"
+
+    if code in _RATE_LIMIT_CODES:
+        # Distinguish RPM vs TPM for better actionability
+        if "token" in code:
+            return "rate_limited_tpm"
+        return "rate_limited_rpm"
+
+    # Unknown code value — still a 429, log the code itself (safe: opaque identifier)
+    return f"rate_limited_unknown_429"
+
+
 def _http_error_category(exc: httpx.HTTPStatusError) -> str:
-    """Map an HTTP status code to a stable diagnostic category string."""
+    """Map an HTTP status code to a stable diagnostic category string.
+
+    For 429 responses, delegates to ``_classify_429`` to distinguish quota
+    exhaustion from transient rate limits.
+    """
     status = exc.response.status_code
     if status == 400:
         return "bad_request"
@@ -37,7 +106,7 @@ def _http_error_category(exc: httpx.HTTPStatusError) -> str:
     if status == 403:
         return "forbidden"
     if status == 429:
-        return "rate_limited"
+        return _classify_429(exc.response)
     if status == 500:
         return "server_error"
     if status == 503:

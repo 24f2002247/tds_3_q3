@@ -18,9 +18,12 @@ import pytest
 
 from app.decision_engine import (
     DecisionEngine,
+    _classify_429,
     _exc_category,
     _fallback_category,
     _http_error_category,
+    _QUOTA_CODES,
+    _RATE_LIMIT_CODES,
 )
 
 # ---------------------------------------------------------------------------
@@ -72,9 +75,21 @@ def _ok_response(action: str = "no_action") -> MagicMock:
 
 
 def _http_error(status: int) -> httpx.HTTPStatusError:
-    """Build an httpx.HTTPStatusError for the given status code."""
+    """Build an httpx.HTTPStatusError with an empty body for the given status code."""
     req = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
     resp = httpx.Response(status, request=req)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=req, response=resp)
+
+
+def _http_error_with_body(status: int, body: dict) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response carries a JSON body."""
+    req = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    resp = httpx.Response(
+        status,
+        request=req,
+        headers={"content-type": "application/json"},
+        content=json.dumps(body).encode(),
+    )
     return httpx.HTTPStatusError(f"HTTP {status}", request=req, response=resp)
 
 
@@ -118,7 +133,6 @@ def test_http_error_category_covers_key_codes():
         (400, "bad_request"),
         (401, "unauthorized"),
         (403, "forbidden"),
-        (429, "rate_limited"),
         (500, "server_error"),
         (503, "service_unavailable"),
         (418, "client_error_418"),
@@ -126,6 +140,10 @@ def test_http_error_category_covers_key_codes():
     ]:
         exc = _http_error(status)
         assert _http_error_category(exc) == expected, f"unexpected category for status {status}"
+
+    # 429 without a body → unknown subcategory (body-less response)
+    exc_429 = _http_error(429)
+    assert _http_error_category(exc_429) == "rate_limited_unknown_429"
 
 
 def test_fallback_category_covers_known_patterns():
@@ -147,8 +165,11 @@ class TestHttpErrorLogging:
         rate_limit_logs = [t for t in warnings if "status=429" in t]
         assert len(rate_limit_logs) == 3, f"expected 3 attempt warnings; got: {warnings}"
         for text in rate_limit_logs:
-            assert "category=rate_limited" in text
+            # category= must be one of the 429 subcategories, not the old generic label
+            assert "category=" in text
             assert "attempt=" in text
+            # The old flat "rate_limited" label must no longer appear alone
+            assert "category=rate_limited\n" not in text + "\n" or "category=rate_limited_" in text
 
     def test_unauthorized_logs_category(self, monkeypatch, caplog):
         result, records = _run(monkeypatch, caplog, MagicMock(side_effect=_http_error(401)))
@@ -173,6 +194,140 @@ class TestHttpErrorLogging:
         errors = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
         assert errors, f"expected at least one ERROR log after exhausting retries; got: {records}"
         assert any("invoking fallback" in t for t in errors)
+
+
+# ---------------------------------------------------------------------------
+# Fine-grained 429 classification
+# ---------------------------------------------------------------------------
+
+class TestClassify429:
+    """Unit tests for _classify_429 and its integration into _http_error_category."""
+
+    # ── _classify_429 directly ───────────────────────────────────────────────
+
+    def test_quota_codes_return_quota_exceeded(self):
+        for code in _QUOTA_CODES:
+            body = {"error": {"code": code, "type": "insufficient_quota",
+                              "message": "sensitive billing detail"}}
+            exc = _http_error_with_body(429, body)
+            result = _classify_429(exc.response)
+            assert result == "quota_exceeded", \
+                f"code={code!r} should map to quota_exceeded, got {result!r}"
+
+    def test_rpm_codes_return_rate_limited_rpm(self):
+        for code in ("rate_limit_exceeded", "slow_down", "requests_per_minute_exceeded"):
+            body = {"error": {"code": code, "type": "rate_limit_exceeded",
+                              "message": "too many requests"}}
+            exc = _http_error_with_body(429, body)
+            result = _classify_429(exc.response)
+            assert result == "rate_limited_rpm", \
+                f"code={code!r} should map to rate_limited_rpm, got {result!r}"
+
+    def test_tpm_code_returns_rate_limited_tpm(self):
+        body = {"error": {"code": "tokens_per_minute_exceeded", "type": "rate_limit_exceeded",
+                          "message": "token budget exceeded"}}
+        exc = _http_error_with_body(429, body)
+        assert _classify_429(exc.response) == "rate_limited_tpm"
+
+    def test_unknown_code_returns_rate_limited_unknown(self):
+        body = {"error": {"code": "some_new_provider_code", "type": "unexpected_429",
+                          "message": "something else"}}
+        exc = _http_error_with_body(429, body)
+        result = _classify_429(exc.response)
+        assert result == "rate_limited_unknown_429"
+
+    def test_empty_body_returns_rate_limited_unknown(self):
+        exc = _http_error(429)   # no JSON body
+        assert _classify_429(exc.response) == "rate_limited_unknown_429"
+
+    def test_non_json_body_returns_rate_limited_unknown(self):
+        req = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+        resp = httpx.Response(
+            429, request=req,
+            headers={"content-type": "text/html"},
+            content=b"<html>Too Many Requests</html>",
+        )
+        exc = httpx.HTTPStatusError("HTTP 429", request=req, response=resp)
+        assert _classify_429(exc.response) == "rate_limited_unknown_429"
+
+    def test_missing_error_key_returns_rate_limited_unknown(self):
+        # Some proxies return {"message": "..."} without a nested "error" object
+        body = {"message": "rate limit hit"}
+        exc = _http_error_with_body(429, body)
+        assert _classify_429(exc.response) == "rate_limited_unknown_429"
+
+    def test_error_type_used_when_code_absent(self):
+        # Providers that only set error.type, not error.code
+        body = {"error": {"type": "insufficient_quota", "message": "billing issue"}}
+        exc = _http_error_with_body(429, body)
+        assert _classify_429(exc.response) == "quota_exceeded"
+
+    def test_error_message_field_is_never_returned(self):
+        """The message field may contain sensitive content; it must not leak into the result."""
+        body = {"error": {"code": "rate_limit_exceeded",
+                          "message": "sk-secret-key prompt content customer email"}}
+        exc = _http_error_with_body(429, body)
+        result = _classify_429(exc.response)
+        assert "sk-secret-key" not in result
+        assert "customer email" not in result
+        assert "prompt content" not in result
+
+    # ── _http_error_category wiring ──────────────────────────────────────────
+
+    def test_http_error_category_delegates_429_to_classify(self):
+        body = {"error": {"code": "insufficient_quota", "message": "billing"}}
+        exc = _http_error_with_body(429, body)
+        assert _http_error_category(exc) == "quota_exceeded"
+
+    def test_http_error_category_non_429_unaffected(self):
+        assert _http_error_category(_http_error(401)) == "unauthorized"
+        assert _http_error_category(_http_error(500)) == "server_error"
+
+    # ── Integration: category appears in WARNING log ─────────────────────────
+
+    def test_quota_exceeded_logged_correctly(self, monkeypatch, caplog):
+        body = {"error": {"code": "insufficient_quota", "message": "billing detail"}}
+        exc = _http_error_with_body(429, body)
+        result, records = _run(monkeypatch, caplog, MagicMock(side_effect=exc))
+
+        warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        quota_logs = [t for t in warnings if "status=429" in t and "category=quota_exceeded" in t]
+        assert len(quota_logs) == 3, \
+            f"expected 3 quota_exceeded warnings; got:\n" + "\n".join(warnings)
+        # The error message field must NOT appear anywhere
+        for text in warnings:
+            assert "billing detail" not in text, "error.message leaked into log"
+
+    def test_rpm_rate_limit_logged_correctly(self, monkeypatch, caplog):
+        body = {"error": {"code": "rate_limit_exceeded", "message": "slow down"}}
+        exc = _http_error_with_body(429, body)
+        result, records = _run(monkeypatch, caplog, MagicMock(side_effect=exc))
+
+        warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        rpm_logs = [t for t in warnings if "status=429" in t and "category=rate_limited_rpm" in t]
+        assert len(rpm_logs) == 3, \
+            f"expected 3 rate_limited_rpm warnings; got:\n" + "\n".join(warnings)
+
+    def test_tpm_rate_limit_logged_correctly(self, monkeypatch, caplog):
+        body = {"error": {"code": "tokens_per_minute_exceeded", "message": "token budget"}}
+        exc = _http_error_with_body(429, body)
+        result, records = _run(monkeypatch, caplog, MagicMock(side_effect=exc))
+
+        warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        tpm_logs = [t for t in warnings if "status=429" in t and "category=rate_limited_tpm" in t]
+        assert len(tpm_logs) == 3, \
+            f"expected 3 rate_limited_tpm warnings; got:\n" + "\n".join(warnings)
+
+    def test_unknown_429_without_body_logged(self, monkeypatch, caplog):
+        result, records = _run(monkeypatch, caplog, MagicMock(side_effect=_http_error(429)))
+
+        warnings = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        unknown_logs = [
+            t for t in warnings
+            if "status=429" in t and "category=rate_limited_unknown_429" in t
+        ]
+        assert len(unknown_logs) == 3, \
+            f"expected 3 rate_limited_unknown_429 warnings; got:\n" + "\n".join(warnings)
 
 
 # ---------------------------------------------------------------------------
