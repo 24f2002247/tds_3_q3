@@ -8,7 +8,7 @@ from .decision_engine import DecisionEngine
 from .schemas import CommitRequest, ProposeRequest
 from .service import ConflictError, MailroomService, NotFoundError
 
-app = FastAPI(title="Safe AI Mailroom", docs_url=None, redoc_url=None)
+app = app = FastAPI(title="Safe AI Mailroom")
 service = MailroomService(DecisionEngine(get_settings().ai_provider))
 
 
