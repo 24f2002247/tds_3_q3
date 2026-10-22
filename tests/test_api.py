@@ -44,3 +44,33 @@ def test_unknown_operation_and_malformed_json():
         assert client.post("/v1/mailroom/actions", json={"operation": "unknown"}).status_code == 400
         assert client.post("/v1/mailroom/actions", content=b"{not-json",
                           headers={"content-type": "application/json"}).status_code == 422
+
+
+def test_openapi_actions_endpoint_has_request_body():
+    with TestClient(app) as client:
+        spec = client.get("/openapi.json").json()
+
+    post = spec["paths"]["/v1/mailroom/actions"]["post"]
+    assert "requestBody" in post, "POST /v1/mailroom/actions must declare a requestBody"
+
+    content = post["requestBody"]["content"]
+    assert "application/json" in content, "requestBody must include application/json content"
+
+    schema = content["application/json"]["schema"]
+    # Must be a oneOf covering both propose and commit shapes
+    assert "oneOf" in schema, "schema must use oneOf to cover propose and commit"
+    assert len(schema["oneOf"]) == 2, "oneOf must have exactly two variants"
+
+    # Each variant must reference or inline an 'operation' property
+    inline_schemas = schema["oneOf"]
+    operations = set()
+    for variant in inline_schemas:
+        props = variant.get("properties", {})
+        assert "operation" in props, f"variant is missing 'operation' property: {variant}"
+        enum_vals = props["operation"].get("enum") or props["operation"].get("const")
+        if isinstance(enum_vals, list):
+            operations.update(enum_vals)
+        elif enum_vals is not None:
+            operations.add(enum_vals)
+    assert "propose" in operations, "propose operation not found in oneOf variants"
+    assert "commit" in operations, "commit operation not found in oneOf variants"
