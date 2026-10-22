@@ -58,6 +58,8 @@ class MailroomService:
             return response
 
     def commit(self, request: CommitRequest) -> dict[str, Any]:
+        raw = request.model_dump(mode="json")
+        fingerprint = sha256_hex(raw)
         with SessionLocal() as db:
             evaluation = db.scalar(select(Evaluation).where(Evaluation.evaluation_id == request.evaluationId))
             if not evaluation:
@@ -65,31 +67,52 @@ class MailroomService:
             if evaluation.input_digest != request.inputDigest:
                 raise ConflictError("inputDigest mismatch")
             if evaluation.committed_json:
-                return json.loads(evaluation.committed_json)
+                if evaluation.commit_fingerprint == fingerprint:
+                    return json.loads(evaluation.committed_json)
+                raise ConflictError("evaluation already committed with different receipts")
+
             proposed = {p["dossierId"]: p for p in json.loads(evaluation.response_json)["proposals"]}
-            if set(proposed) != {r.dossierId for r in request.receipts}:
+            receipt_ids = {receipt.dossierId for receipt in request.receipts}
+            if set(proposed) != receipt_ids:
                 raise ValueError("receipt set does not match proposals")
+
+            verifier = json.loads(evaluation.verifier_json)
+            validate_verifier(verifier)
             outcomes = []
+            receipt_records = []
             for receipt in request.receipts:
                 p = proposed[receipt.dossierId]
                 r = receipt.model_dump()
-                if not verify_receipt(json.loads(evaluation.verifier_json), request.evaluationId,
-                                      request.inputDigest, r):
-                    raise ValueError("invalid receipt signature")
-                if (receipt.callId != p["callId"] or receipt.action != p["action"] or
+                if (receipt.dossierId != p["dossierId"] or
+                        receipt.callId != p["callId"] or receipt.action != p["action"] or
                         receipt.proposalDigest != proposal_digest(p)):
                     raise ValueError("receipt does not match proposal")
+                if not verify_receipt(verifier, request.evaluationId, request.inputDigest, r):
+                    raise ValueError("invalid receipt signature")
                 status = "executed" if receipt.accepted else "rejected"
-                db.add(ReceiptRecord(evaluation_id=request.evaluationId, dossier_id=receipt.dossierId,
-                                     call_id=receipt.callId, receipt_id=receipt.receiptId,
-                                     accepted=receipt.accepted, outcome=status))
+                receipt_records.append(ReceiptRecord(
+                    evaluation_id=request.evaluationId, dossier_id=receipt.dossierId,
+                    call_id=receipt.callId, receipt_id=receipt.receiptId,
+                    accepted=receipt.accepted, outcome=status))
                 outcomes.append({"dossierId": receipt.dossierId, "callId": receipt.callId,
                                  "action": receipt.action, "proposalDigest": receipt.proposalDigest,
                                  "receiptId": receipt.receiptId, "status": status})
             response = {"profile": request.profile, "evaluationId": request.evaluationId,
                         "status": "completed", "inputDigest": request.inputDigest, "outcomes": outcomes}
             evaluation.committed_json = json.dumps(response, separators=(",", ":"))
-            db.commit()
+            evaluation.commit_fingerprint = fingerprint
+            db.add_all(receipt_records)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                existing = db.scalar(select(Evaluation).where(
+                    Evaluation.evaluation_id == request.evaluationId))
+                if existing and existing.committed_json:
+                    if existing.commit_fingerprint == fingerprint:
+                        return json.loads(existing.committed_json)
+                    raise ConflictError("evaluation already committed with different receipts")
+                raise
             return response
 
 

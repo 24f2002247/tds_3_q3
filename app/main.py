@@ -1,20 +1,27 @@
 import json
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
-from .database import init_db
+
 from .config import get_settings
+from .database import init_db
 from .decision_engine import DecisionEngine
 from .schemas import CommitRequest, ProposeRequest
 from .service import ConflictError, MailroomService, NotFoundError
 
-app = app = FastAPI(title="Safe AI Mailroom")
-service = MailroomService(DecisionEngine(get_settings().ai_provider))
 
-
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(application: FastAPI):
     init_db()
+    yield
+
+
+app = FastAPI(title="Safe AI Mailroom", lifespan=lifespan)
+
+settings = get_settings()
+service = MailroomService(DecisionEngine(settings.ai_provider))
 
 
 @app.get("/health")
@@ -26,13 +33,14 @@ def health():
 async def actions(request: Request):
     try:
         body = await request.body()
-        if len(body) > 2_000_000:
+        if len(body) > settings.max_body_bytes:
             return JSONResponse({"error": "request too large"}, status_code=413)
         raw = json.loads(body)
-        if raw.get("operation") == "propose":
+        operation = raw.get("operation")
+        if operation == "propose":
             parsed = ProposeRequest.model_validate(raw)
             result = service.propose(parsed)
-        elif raw.get("operation") == "commit":
+        elif operation == "commit":
             parsed = CommitRequest.model_validate(raw)
             result = service.commit(parsed)
         else:

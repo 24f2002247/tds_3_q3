@@ -24,6 +24,7 @@ class Evaluation(Base):
     response_json: Mapped[str] = mapped_column(Text)
     verifier_json: Mapped[str] = mapped_column(Text)
     committed_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    commit_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class ReceiptRecord(Base):
