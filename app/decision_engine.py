@@ -6,6 +6,7 @@ The mock path is used for testing only.
 All proposals are validated against the frozen action schemas before persistence.
 """
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -13,6 +14,56 @@ import httpx
 
 from .canonical import sha256_hex
 from .safety import validate_proposal
+
+log = logging.getLogger(__name__)
+
+
+def _exc_category(exc: Exception) -> str:
+    """Return a safe, content-free label for an exception.
+
+    Used in log messages so that no raw dossier content, model output, or
+    provider error bodies are forwarded to the log sink.
+    """
+    return type(exc).__name__
+
+
+def _http_error_category(exc: httpx.HTTPStatusError) -> str:
+    """Map an HTTP status code to a stable diagnostic category string."""
+    status = exc.response.status_code
+    if status == 400:
+        return "bad_request"
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "forbidden"
+    if status == 429:
+        return "rate_limited"
+    if status == 500:
+        return "server_error"
+    if status == 503:
+        return "service_unavailable"
+    if 400 <= status < 500:
+        return f"client_error_{status}"
+    if 500 <= status < 600:
+        return f"server_error_{status}"
+    return f"http_{status}"
+
+
+def _fallback_category(reason: str) -> str:
+    """Derive a content-free category label from the internal reason string.
+
+    The reason string may contain model output; we must not log it directly.
+    """
+    low = reason.lower()
+    if "disallowed action" in low:
+        return "disallowed_action"
+    if "validation" in low or "validate" in low or "invalid" in low:
+        return "validation_failure"
+    if "3 attempts" in low or "retries" in low or "failed" in low:
+        return "exhausted_retries"
+    if "api_key" in low or "key" in low:
+        return "missing_credential"
+    return "ai_error"
 
 # ── Frozen action type specifications ──────────────────────────────────────────
 ACTION_SPECS = """
@@ -120,6 +171,7 @@ class DecisionEngine:
         if not settings.ai_api_key:
             raise RuntimeError("AI_API_KEY is required for a hosted provider")
 
+        dossier_id = dossier["dossierId"]
         user_prompt = _build_user_prompt(dossier, allowed, call_id)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -145,42 +197,87 @@ class DecisionEngine:
                 proposal = json.loads(content)
                 # Enforce correct callId and dossierId regardless of model output
                 proposal["callId"] = call_id
-                proposal["dossierId"] = dossier["dossierId"]
-                # Validate action is allowed
-                if proposal.get("action") not in allowed:
-                    proposal = self._fallback_proposal(dossier, allowed, call_id,
-                                                       f"model returned disallowed action: {proposal.get('action')}")
+                proposal["dossierId"] = dossier_id
+                # Validate action is allowed; fall back immediately if not
+                returned_action = proposal.get("action")
+                if returned_action not in allowed:
+                    log.warning(
+                        "ai_decide: model returned disallowed action dossier_id=%s "
+                        "attempt=%d action=%s",
+                        dossier_id, attempt + 1, returned_action,
+                    )
+                    return self._fallback_proposal(
+                        dossier, allowed, call_id,
+                        f"model returned disallowed action: {returned_action}",
+                    )
                 validate_proposal(proposal, dossier, allowed)
+                log.debug(
+                    "ai_decide: proposal accepted dossier_id=%s attempt=%d action=%s",
+                    dossier_id, attempt + 1, returned_action,
+                )
                 return proposal
+
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                category = _http_error_category(exc)
+                log.warning(
+                    "ai_decide: HTTP error dossier_id=%s attempt=%d/%d "
+                    "status=%d category=%s",
+                    dossier_id, attempt + 1, 3,
+                    exc.response.status_code, category,
+                )
             except Exception as exc:
                 last_exc = exc
-                if attempt == 2:
-                    break
-        # Fallback after all retries
-        return self._fallback_proposal(dossier, allowed, call_id,
-                                       f"AI failed after 3 attempts: {last_exc}")
+                log.warning(
+                    "ai_decide: unexpected error dossier_id=%s attempt=%d/%d "
+                    "exc_type=%s",
+                    dossier_id, attempt + 1, 3,
+                    _exc_category(exc),
+                )
+
+        # All three attempts exhausted
+        log.error(
+            "ai_decide: all attempts failed dossier_id=%s exc_type=%s — invoking fallback",
+            dossier_id, _exc_category(last_exc) if last_exc else "unknown",
+        )
+        return self._fallback_proposal(
+            dossier, allowed, call_id,
+            f"AI failed after 3 attempts: {_exc_category(last_exc) if last_exc else 'unknown'}",
+        )
 
     def _fallback_proposal(self, dossier: dict[str, Any], allowed: set[str],
                            call_id: str, reason: str) -> dict[str, Any]:
-        """Safe fallback: create_draft or no_action when AI fails."""
+        """Safe fallback: no_action or create_draft when AI fails or returns an invalid proposal."""
+        dossier_id = dossier["dossierId"]
+        category = _fallback_category(reason)
         all_lines = [line["lineId"] for source in dossier["sources"] for line in source["lines"]]
         first_line = all_lines[0] if all_lines else "unknown"
+
         if "no_action" in allowed:
             import hashlib
-            ref = hashlib.sha256(dossier["dossierId"].encode()).hexdigest()[:16]
+            ref = hashlib.sha256(dossier_id.encode()).hexdigest()[:16]
+            log.warning(
+                "fallback_proposal: using no_action dossier_id=%s category=%s",
+                dossier_id, category,
+            )
             return {
-                "dossierId": dossier["dossierId"],
+                "dossierId": dossier_id,
                 "callId": call_id,
                 "action": "no_action",
                 "target": None,
                 "payload": {"reasonCode": "INFORMATIONAL", "referenceId": ref},
                 "evidence": [first_line],
             }
+
         if "create_draft" in allowed:
             import hashlib
-            ref = hashlib.sha256(dossier["dossierId"].encode()).hexdigest()[:16]
+            ref = hashlib.sha256(dossier_id.encode()).hexdigest()[:16]
+            log.warning(
+                "fallback_proposal: using create_draft dossier_id=%s category=%s",
+                dossier_id, category,
+            )
             return {
-                "dossierId": dossier["dossierId"],
+                "dossierId": dossier_id,
                 "callId": call_id,
                 "action": "create_draft",
                 "target": {"kind": "draft_queue", "id": f"mailbox:{dossier['mailbox']}"},
@@ -192,8 +289,13 @@ class DecisionEngine:
                 },
                 "evidence": [first_line],
             }
-        # Last resort
-        action = next(iter(allowed))
+
+        # Last resort: delegate to mock classifier
+        log.warning(
+            "fallback_proposal: no safe action available, delegating to mock "
+            "dossier_id=%s category=%s",
+            dossier_id, category,
+        )
         return self._mock_decide(dossier, allowed, call_id)
 
     # ── Mock path (tests and fallback) ─────────────────────────────────────────
